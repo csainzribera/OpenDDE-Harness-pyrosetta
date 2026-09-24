@@ -160,6 +160,7 @@ Names in this table are relative to `design`.
 | `stagnation_full_redesign_threshold` | `0` (off); non-negative integer | Request full redesign after the configured no-improvement streak, subject to its repeat interval. |
 | `optimization_metric` | `loss`; `loss` or `iptm` | Minimize the weighted loss or maximize ipTM. No separate direction field is needed. |
 | `loss_weights` | Built-in coefficients below | Partial mapping overrides named coefficients; omitted coefficients retain defaults. Set a term to 0 to disable it. |
+| `metric_loss_terms` | `{}` | Additional named PyRosetta or raw confidence (`min_ipae`, `ipsae`) terms with explicit direction, weight, scale and reference. Positive weights require loss optimization; only PyRosetta terms require enabled PyRosetta analysis. Bounded mode requires explicit anchors and group assignment for each active term. See [metric loss terms](pyrosetta.md#raw-confidence-metric-loss-terms). |
 | `cdr_contact_fraction_threshold` | `0.5` | Hard CDR-contact gate threshold; intended fractional values are in [0,1]. |
 | `hotspot_contact_cutoff_a` | `5.0` Å | Distance used to evaluate hotspot contact evidence. Use a positive distance. |
 | `enable_quality_check` | `true` | Enable eligible Quality Agent checks after geometry gates. |
@@ -167,8 +168,16 @@ Names in this table are relative to `design`.
 | `initial_structure_path` | Unset | Optional compute-readable initial complex used for structural design context. It does not skip initial folding. |
 | `esm_device` | Unset | ESM2 device hint such as `cuda:0`; compute placement/runtime may determine the actual device. API folding still uses local ESM2 for relevant scoring/proposals. |
 | `post_refold_filter` | Optional mapping | Optional terminal SolubleMPNN/refold/filter stage. |
-| `post_refold_filter.enabled` | `false` | Enable terminal refolding and agent ranking. Extra computation follows the search. |
-| `post_refold_filter.top_k` | `20`; positive integer | Maximum final selections; also determines the current bounded refold parent pool. Has no effect when disabled. |
+| `post_refold_filter.enabled` | `false` | Enable terminal refolding, hard-gated objective selection, and advisory agent commentary. Extra computation follows the search. |
+| `post_refold_filter.top_k` | `20`; positive integer | Maximum final selections; also determines the default refold parent pool cap when enabled. |
+| `post_refold_filter.max_parents` | Omitted: `4 * top_k` | Positive integer cap on objective-ordered, gate-passing trajectory parents sent to SolubleMPNN. |
+| `post_refold_filter.samples_per_parent` | `40` | Positive integer number of SolubleMPNN sequence samples per parent. |
+| `post_refold_filter.survivors_per_parent` | `4` | Positive integer number of distinct valid sequences to refold per parent; cannot exceed samples per parent. |
+| `loss_combination` | Omitted: legacy linear objective | Opt-in fixed-range, group-budget objective; requires `optimization_metric: loss`. |
+| `loss_combination.mode` | Required when present | `bounded_grouped`. |
+| `loss_combination.calibration_id` | Required when present | Nonempty identifier for the frozen anchor/budget configuration; no automatic scientific calibration. |
+| `loss_combination.groups` | Required when present | Named groups with positive `budget` summing to one and `terms` assigning every enabled component exactly once. |
+| `loss_combination.anchors` | Required when present | Finite explicit `good`/`bad` values for every enabled structural, ESM2 and metric term; no default ranges. |
 
 Supported skill keys under `router_skill_probabilities`:
 
@@ -217,12 +226,35 @@ change selected terms only.
 | `esm2` | 0.1 | ESM2 sequence-prior loss. |
 
 Terminal refolding currently uses unique, gate-passing, finitely scored trajectory
-parents ordered by the objective, capped at `4 * top_k`. SolubleMPNN samples 40
-variants per parent and selects up to the required four distinct valid variants
-for refolding. Failed or insufficient groups remain failures. Agent rankings must
-cover eligible candidates with contiguous ranks. If the post-filter agent fails,
-the implementation can fall back to deterministic objective ordering; inspect
-`final_selection` errors and mode rather than assuming agent ranking succeeded.
+parents ordered by the objective, capped at `max_parents` (default `4 * top_k`).
+SolubleMPNN samples `samples_per_parent` variants and selects up to
+`survivors_per_parent` distinct valid variants for refolding (defaults 40 and 4).
+These workload limits do not change sequence constraints, gates or PyRosetta
+relaxation. Failed groups remain failures; shortfalls are recorded explicitly.
+Fresh refolds must
+pass the same successful-scoring, canonical-sequence and geometry gates as search,
+retain a structure, and pass any configured conditional Quality Agent check.
+Positive-weight loss metrics must be present and finite. Parent gate/quality
+verdicts are not reused for refolded sequences. CDR-contact and configured hotspot
+gates remain hard constraints, including when an agent praises a failed candidate.
+
+Final ordering is always deterministic by the configured objective (`loss` is the
+full composite, including PyRosetta terms), respecting `minimize`. The first
+`top_k` eligible candidates are selected. PostFilter explanations and rank
+suggestions are advisory; they cannot override gates, ordering, or top K. Invalid
+or unavailable commentary uses the identical objective ordering and records the
+agent error. An enabled terminal stage with no eligible candidates records
+`final_selection.mode: failed`, preserves rejected candidates and their evidence,
+and makes the task `failed`, not `completed`. Search results remain available.
+
+The bounded objective transforms each enabled raw component into
+`clip((raw - good) / (bad - good), 0, 1)`, normalizes the existing positive
+coefficients within each group, and applies explicit group budgets. It changes
+the objective version only when opted in. No anchors, budgets or biological
+calibration are inferred from the current candidate batch. See the
+[bounded-objective configuration and audit schema](pyrosetta.md#opt-in-bounded-objective-with-fixed-group-budgets)
+for an explicit illustrative example, orientation rules and preserved linear
+diagnostics. Hard gates remain separate from the score.
 
 ## Fold fields
 
@@ -251,6 +283,7 @@ and local A3M paths. Local GPU/image settings do not allocate remote API GPUs.
 | `gpus` | `"all"` | Local GPU selection; use worker-visible IDs. API mode does not use this to select remote GPUs. |
 | `persistent_worker` | `true` | Reuse the local inference worker instead of one-shot execution where supported. |
 | `persistent_worker_timeout_seconds` | 900 | Persistent worker wait/readiness timeout. |
+| `pyrosetta` | Disabled | Optional CPU FastRelax followed by InterfaceAnalyzer on the selected fold/refold complex. See [configuration and metrics](pyrosetta.md). |
 | `subprocess_timeout_seconds` | 7200 | One-shot Docker batch timeout. |
 | `ipsae_dist_cutoff` | 10.0 Å | Distance threshold for ipSAE reporting. |
 | `ipsae_pae_cutoff` | 10.0 | PAE threshold for ipSAE reporting. |

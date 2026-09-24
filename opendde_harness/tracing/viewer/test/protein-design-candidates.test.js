@@ -7,6 +7,10 @@ const shell = require('../ui/shell')
 const {
   PROPERTY_DEFINITIONS,
   metricLabel,
+  metricDescription,
+  refreshTableFilterRange,
+  tableFilterSliderPosition,
+  updateTableFilterRange,
   revealCandidateRow,
   alignStructureArtifacts,
   candidateCdrRegions,
@@ -111,7 +115,7 @@ test('post-filter reads final contact and loss evidence without borrowing design
       decisions: [
         {
           candidateId: 'ok',
-          metrics: { iptm: 0.8, ranking_score: 0.7, loss: 1.2 },
+          metrics: { iptm: 0.8, ranking_score: 0.7, loss: 1.2, min_ipae: 0.3 },
           metadata: {
             gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
             loss: { loss_components: { i_pae: 0.3 } }
@@ -151,6 +155,344 @@ test('metric labels use canonical scientific capitalization', () => {
     'confidence.plddt': 'pLDDT'
   })) {
     assert.equal(metricLabel(key), label)
+  }
+})
+
+test('Rosetta metrics are selectable and analysis status exposes escaped loss and failure details', () => {
+  const metrics = { rosetta_interface_dg: -12.5, rosetta_interface_sc: 0.65 }
+  const metadata = {
+    pyrosetta: {
+      status: 'success',
+      elapsed_seconds: 2,
+      provenance: { score_function: 'ref2015' },
+      contact_residues: [
+        { chain_id: 'B', residue_index: 9, amino_acid: 'W', bound_score_reu: -2, interface_dg_reu: -1 }
+      ]
+    },
+    loss: {
+      components: {
+        rosetta_interface_dg: { raw: -12.5, direction: 'minimize', weight: 0.5, scale: 10, contribution: -0.625 }
+      }
+    }
+  }
+  const candidate = { candidateId: 'relaxed', sequence: 'AAA', cycle: 1, metrics, metadata }
+  const run = { cycles: [{ cycle: 1, candidates: [candidate] }] }
+  const html = renderProteinDesignDashboard({ run })
+  assert.match(html, /PyRosetta: success/)
+  assert.match(html, /FastRelax → InterfaceAnalyzer/)
+  assert.match(html, /loss contribution -0.625/)
+  assert.match(html, /B\[9\] W: bound -2, interface ΔG -1/)
+  assert.match(html, /value="metric:rosetta_interface_dg">Interface ΔG \(REU\)/)
+  assert.match(html, /&quot;rosetta_interface_dg&quot;:-12.5/)
+  assert.equal(metricLabel('rosetta_interface_sasa'), 'Interface ΔSASA (Å²)')
+  metadata.pyrosetta = { status: 'failed', error: '<script>bad</script>' }
+  const failed = renderProteinDesignDashboard({ run })
+  assert.match(failed, /PyRosetta: failed/)
+  assert.match(failed, /&lt;script&gt;bad&lt;\/script&gt;/)
+  assert.doesNotMatch(failed, /<script>bad/)
+
+  run.postFilter = { decisions: [{ candidateId: 'relaxed', metrics: {} }] }
+  const refold = resultRun(run, 'post-filter')
+  assert.equal(candidateGroups(refold)[0].candidates[0].metadata.pyrosetta, null)
+  assert.doesNotMatch(renderProteinDesignDashboard({ run: refold }), /PyRosetta: failed/)
+})
+
+test('loss breakdown shows stored coefficients and signed values with full precision', () => {
+  const loss = {
+    structure_loss: 2,
+    esm2_pll: -1,
+    esm2_weight: 0.1,
+    esm2_contribution: 0.1,
+    metric_loss: -3.2123456789,
+    loss: -1.1123456789,
+    components: {
+      rosetta_interface_dg: {
+        raw: -64,
+        direction: 'minimize',
+        weight: 0.5,
+        reference: 0,
+        scale: 10,
+        normalized: -6.4,
+        contribution: -3.2
+      },
+      rosetta_interface_sc: {
+        raw: 0.5123456789,
+        direction: 'maximize',
+        weight: 1,
+        reference: 0.5,
+        scale: 1,
+        normalized: 0.0123456789,
+        contribution: -0.0123456789
+      }
+    }
+  }
+  const candidate = { candidateId: 'scored', metrics: { loss: -1.1123456789 }, metadata: { loss } }
+  const projected = { objectiveKey: 'loss', minimize: true, cycles: [{ cycle: 1, candidates: [candidate] }] }
+  const html = renderProteinDesignDashboard({ run: projected })
+  assert.match(html, /<details class="protein-loss-details"><summary>Loss breakdown · minimize/)
+  assert.match(html, /Original \/ base loss<\/strong> <span data-value="2.1"/)
+  assert.match(html, /Metric subtotal<\/strong> <span data-value="-3.2123456789"/)
+  assert.match(html, /Composite loss<\/strong> <span data-value="-1.1123456789"/)
+  assert.match(html, /<th>Reference<\/th><th>Scale<\/th><th>Normalized<\/th><th>Contribution<\/th>/)
+  assert.match(html, /data-value="0.5123456789" title="0.5123456789"/)
+  assert.match(html, /data-loss-term="esm2"/)
+  assert.match(metricDescription('rosetta_interface_sc', projected), /Higher is preferred/)
+  assert.match(metricDescription('rosetta_interface_dg', projected), /Lower is preferred.*REU/)
+  loss.base_loss = 2.25
+  assert.match(
+    renderProteinDesignDashboard({ run: projected }),
+    /Original \/ base loss<\/strong> <span data-value="2.25"/
+  )
+})
+
+test('bounded loss shows fixed calibration, grouped penalties and separate non-selection diagnostics', () => {
+  const loss = {
+    formula_version: 'bounded-fixed-grouped-v1',
+    loss_combination: { calibration_id: '<trial-anchors>' },
+    structure_loss: 0.1,
+    esm2_contribution: 0.1,
+    base_loss: 0.2,
+    metric_loss: 0.15,
+    loss: 0.35,
+    original_base_loss: 2.1,
+    legacy_loss: -1.9,
+    groups: {
+      structure: { budget: 0.5, contribution: 0.1 },
+      naturalness: { budget: 0.2, contribution: 0.1 },
+      interface: { budget: 0.3, contribution: 0.15 }
+    },
+    components: {
+      plddt: {
+        raw: 0.2,
+        good: 0,
+        bad: 1,
+        penalty: 0.2,
+        group: 'structure',
+        weight: 1,
+        normalized_weight: 1,
+        effective_weight: 0.5,
+        contribution: 0.1
+      },
+      rosetta_interface_dg: {
+        raw: -30.123456789,
+        good: -60,
+        bad: 0,
+        penalty: 0.5,
+        group: 'interface',
+        weight: 0.5,
+        normalized_weight: 1,
+        effective_weight: 0.3,
+        contribution: 0.15
+      }
+    },
+    esm2_component: {
+      raw: -2,
+      good: -1,
+      bad: -3,
+      penalty: 0.5,
+      group: 'naturalness',
+      weight: 0.1,
+      normalized_weight: 1,
+      effective_weight: 0.2,
+      contribution: 0.1
+    }
+  }
+  const candidate = {
+    candidateId: 'bounded',
+    objective: 0.35,
+    metrics: { loss: 0.35 },
+    metadata: { loss, pyrosetta: { status: 'success' } }
+  }
+  const html = renderProteinDesignDashboard({
+    run: { objectiveKey: 'loss', minimize: true, cycles: [{ cycle: 1, candidates: [candidate] }] }
+  })
+  assert.match(html, /Loss breakdown · bounded · minimize/)
+  assert.match(html, /Composite loss \[0, 1\]<\/strong> <span data-value="0.35"/)
+  assert.match(html, /Bounded structural \+ ESM2 subtotal<\/strong> <span data-value="0.2"/)
+  assert.match(html, /Calibration: <code>&lt;trial-anchors&gt;<\/code>/)
+  assert.match(html, /explicitly configured fixed anchors, not universal scientific defaults/)
+  assert.match(html, /Penalty = clip\(\(raw − good\) \/ \(bad − good\), 0, 1\)/)
+  assert.match(html, /data-loss-group="interface"/)
+  assert.match(html, /<th>Within-group weight<\/th><th>Effective weight<\/th>/)
+  assert.match(html, /data-value="-30.123456789" title="-30.123456789"/)
+  assert.match(html, /data-loss-term="esm2".*?<td>maximize<\/td>/)
+  assert.match(html, /Linear diagnostics only — not used for selection/)
+  assert.match(html, /Legacy linear composite <span data-value="-1.9"/)
+  assert.doesNotMatch(html, /Metric contribution = sign/)
+  assert.doesNotMatch(html, /reference -, scale -/)
+})
+
+test('minimum ipAE never substitutes a transformed loss term or the distinct ipSAE score', () => {
+  const definition = PROPERTY_DEFINITIONS.find(item => item.key === 'min_ipa')
+  const candidate = { metrics: { ipsae: 0.8, min_ipsae: 0.7 }, metadata: { loss: { loss_components: { i_pae: 0.5 } } } }
+  assert.equal(propertyValue(candidate, definition), null)
+  candidate.metrics.min_ipae = 4.2
+  assert.equal(propertyValue(candidate, definition), 4.2)
+})
+
+test('raw minimum ipAE is displayed once through its canonical property alias', () => {
+  const candidate = { candidateId: 'raw-pae', metrics: { min_ipae: 4.23456789, ranking: 0.7 } }
+  const run = { cycles: [{ cycle: 0, candidates: [candidate] }] }
+  const definitions = propertyDefinitions(null, run)
+  assert.equal(definitions.filter(item => item.label === 'Min ipAE').length, 1)
+  assert.equal(
+    definitions.some(item => item.key === 'metric:min_ipae'),
+    false
+  )
+  assert.equal(
+    definitions.some(item => item.key === 'metric:ranking'),
+    false
+  )
+  const definition = definitions.find(item => item.key === 'min_ipa')
+  assert.equal(propertyValue(candidate, definition), 4.23456789)
+  assert.match(metricDescription(definition.key, run), /Å; raw minimum interchain predicted aligned error/)
+  assert.match(renderProteinDesignDashboard({ run }), /data-value="4.23456789" title="4.23456789"/)
+  delete candidate.metrics.min_ipae
+  candidate.metadata = { min_ipae: { status: 'unavailable', reason: 'Missing <confidence> data' } }
+  assert.match(renderProteinDesignDashboard({ run }), /Min ipAE unavailable: Missing &lt;confidence&gt; data/)
+})
+
+test('live refresh keeps untouched filter endpoints open as real candidate domains expand', () => {
+  let range = refreshTableFilterRange(undefined, { min: 0, max: 1 })
+  for (const domain of [
+    { min: 6.98, max: 6.98 },
+    { min: 6.98, max: 7.28 },
+    { min: 6.98, max: 17.2 }
+  ]) {
+    range = refreshTableFilterRange(range, domain)
+    assert.deepEqual(range, { min: domain.min, max: domain.max, domainMin: domain.min, domainMax: domain.max })
+    assert.equal(range.min > range.domainMin || range.max < range.domainMax, false)
+  }
+  assert.deepEqual(refreshTableFilterRange(range, { min: 1, max: 2 }), {
+    min: 1,
+    max: 2,
+    domainMin: 1,
+    domainMax: 2
+  })
+})
+
+test('live refresh preserves deliberately narrowed filter bounds while untouched endpoints follow data', () => {
+  const base = { min: 0, max: 1, domainMin: 0, domainMax: 1 }
+  const domain = { min: -1, max: 2 }
+  assert.deepEqual(refreshTableFilterRange({ ...base, min: 0.3 }, domain), {
+    min: 0.3,
+    max: 2,
+    domainMin: -1,
+    domainMax: 2
+  })
+  assert.deepEqual(refreshTableFilterRange({ ...base, max: 0.7 }, domain), {
+    min: -1,
+    max: 0.7,
+    domainMin: -1,
+    domainMax: 2
+  })
+  assert.deepEqual(refreshTableFilterRange({ ...base, min: 0.3, max: 0.7 }, domain), {
+    min: 0.3,
+    max: 0.7,
+    domainMin: -1,
+    domainMax: 2
+  })
+})
+
+test('metric sliders preserve untouched full-precision bounds and reach both exact endpoints', () => {
+  const domain = { min: 0.4623327629429888, max: 0.4774059724547533 }
+  const range = refreshTableFilterRange(undefined, domain)
+  updateTableFilterRange(range, 'min', 1, 1000)
+  assert.equal(range.max, domain.max)
+  assert.ok(range.min > domain.min && range.min < domain.max)
+  assert.deepEqual(
+    [domain.min, domain.max].filter(value => value >= range.min && value <= range.max),
+    [domain.max]
+  )
+  assert.equal(tableFilterSliderPosition(range, 'min', 1000), 1)
+  assert.equal(tableFilterSliderPosition(range, 'max', 1000), 1000)
+  assert.deepEqual(refreshTableFilterRange(range, domain), range)
+  updateTableFilterRange(range, 'min', 0, 1000)
+  assert.equal(range.min, domain.min)
+  updateTableFilterRange(range, 'max', 999, 1000)
+  assert.equal(range.min, domain.min)
+  assert.ok(range.max < domain.max)
+  updateTableFilterRange(range, 'max', 1000, 1000)
+  assert.equal(range.max, domain.max)
+  assert.equal(range.min > range.domainMin || range.max < range.domainMax, false)
+  const run = { cycles: [{ cycle: 0, candidates: [domain.min, domain.max].map(loss => ({ metrics: { loss } })) }] }
+  assert.match(
+    renderProteinDesignDashboard({ run }),
+    /min="0" max="1000" step="1" value="1000" data-candidate-filter="loss"/
+  )
+})
+
+test('filter ticks preserve signed and tiny metric ranges, count increments, and crossed bounds', () => {
+  for (const domain of [
+    { min: -68.22, max: -12.5 },
+    { min: 1e-20, max: 2e-20 },
+    { min: 7, max: 10 },
+    { min: 0, max: 0 }
+  ]) {
+    const range = refreshTableFilterRange(undefined, domain)
+    updateTableFilterRange(range, 'max', 0, 1000)
+    assert.equal(range.max, domain.min)
+    updateTableFilterRange(range, 'min', 1000, 1000)
+    assert.equal(range.min, domain.max)
+    assert.equal(range.max, domain.max)
+    updateTableFilterRange(range, 'max', 0, 1000)
+    assert.equal(range.min, domain.min)
+    const unchanged = { ...range }
+    updateTableFilterRange(range, 'min', NaN, 1000)
+    assert.deepEqual(range, unchanged)
+  }
+  const count = refreshTableFilterRange(undefined, { min: 7, max: 10 })
+  updateTableFilterRange(count, 'min', 1, 3)
+  assert.equal(count.min, 8)
+  assert.equal(count.max, 10)
+  assert.equal(tableFilterSliderPosition(count, 'min', 3), 1)
+})
+
+test('cycle leader follows the minimized composite objective even when ranking score disagrees', () => {
+  const better = { candidateId: 'lower-composite', objective: -3.5, metrics: { ranking_score: 0.2 } }
+  const worse = { candidateId: 'higher-ranking', objective: 1.2, metrics: { ranking_score: 0.9 } }
+  const run = { objectiveKey: 'loss', minimize: true, cycles: [{ cycle: 1, candidates: [worse, better] }] }
+  assert.equal(candidateGroups(run)[0].candidates[0], better)
+  assert.match(renderProteinDesignDashboard({ run }), /Best Loss \(minimize\)/)
+  run.minimize = false
+  assert.equal(candidateGroups(run)[0].candidates[0], worse)
+  run.cycles[0].cycleBestCandidateId = 'lower-composite'
+  assert.equal(candidateGroups(run)[0].candidates[0], better)
+})
+
+test('scientific property axes include negative, mixed, constant, count and confidence values', () => {
+  const samples = [
+    ['loss', [-3.2, -0.2, 0.01]],
+    ['rosetta_interface_dg', [-68.22165166709135, -12.5]],
+    ['rosetta_total_score', [-1044.076175999564, -1000]],
+    ['rosetta_interface_dg_per_sasa', [-2.4695456343275235, -2.4695456343275235]],
+    ['rosetta_interface_sc', [0.54, 0.63]],
+    ['rosetta_interface_sasa', [2301, 2762.518364462969]],
+    ['rosetta_interface_hbonds', [0, 24]],
+    ['rosetta_interface_unsat_hbonds', [0, 22]],
+    ['rosetta_interface_residues', [0, 101]],
+    ['plddt', [0.71, 0.88]],
+    ['confidence.plddt', [71, 88]],
+    ['custom', [0, 0]]
+  ]
+  for (const [key, values] of samples) {
+    const candidates = values.map(value => ({ metrics: { [key]: value } }))
+    const definition = { key: `metric:${key}`, paths: [`metrics.${key}`] }
+    assert.equal(propertyValue(candidates[0], definition), values[0], key)
+    const geometry = parallelGeometry(candidates, [definition])
+    const axis = geometry.axes[0]
+    assert.ok(axis.max > axis.min, key)
+    for (const value of values) {
+      assert.ok(value >= axis.min && value <= axis.max, key)
+      assert.ok(
+        geometry.y(value, axis) >= geometry.top && geometry.y(value, axis) <= geometry.height - geometry.bottom,
+        key
+      )
+    }
+    const ticks = propertyTicks(axis)
+    assert.equal(ticks[0], axis.max)
+    assert.ok(Math.abs(ticks.at(-1) - axis.min) < 1e-9, key)
+    if (/hbonds|residues/.test(key)) assert.ok(ticks.every(Number.isInteger), key)
   }
 })
 
@@ -210,6 +552,7 @@ const candidate = (candidateId, cycle, rankingScore, overrides = {}) => ({
     iptm: overrides.iptm ?? 0.72,
     ranking_score: rankingScore,
     ipsae: overrides.ipsae ?? 0.58,
+    min_ipae: overrides.minIpa ?? 0.23,
     cdr_total_contacts: overrides.contacts ?? 12,
     framework_total_contacts: overrides.frameContacts ?? 2
   },
@@ -322,7 +665,7 @@ test('rigidly aligns multiple PDB structures by their alpha carbons', () => {
   assert.ok(rmsd < 0.002, `expected aligned RMSD below 0.002, received ${rmsd}`)
 })
 
-test('sorts every cycle by descending ranking score and starts with no comparison selection', () => {
+test('breaks equal objective ties by ranking score and starts with no comparison selection', () => {
   const groups = candidateGroups(run)
   assert.deepEqual(
     groups.map(group => group.cycle),
@@ -458,7 +801,7 @@ test('keeps long candidate rows compact while exposing the full sequence preview
   assert.match(html, /repeat\(3,var\(--protein-sequence-cell-width\)\)/)
 })
 
-test('uses zero-based rounded axes, equal spacing, and colors by the last visible property', () => {
+test('uses zero-based rounded axes, equal spacing, and optional last-visible-property coloring', () => {
   const geometry = parallelGeometry(run.cycles.flatMap(cycle => cycle.candidates))
   assert.equal(
     geometry.axes.every(axis => axis.min === 0),
@@ -483,7 +826,7 @@ test('uses zero-based rounded axes, equal spacing, and colors by the last visibl
   )
   assert.equal(subsetGeometry.axes[1].x - subsetGeometry.axes[0].x, subsetGeometry.axes[2].x - subsetGeometry.axes[1].x)
 
-  const html = renderParallelCoordinates(run, new Set())
+  const html = renderParallelCoordinates(run, new Set(), null, PROPERTY_DEFINITIONS, false, 'last-property')
   assert.match(html, /id="proteinPropertyColorGradient"/)
   assert.match(html, /class="protein-property-color-scale"/)
   assert.match(html, /data-color-property="frame_contacts"/)
@@ -505,7 +848,7 @@ test('uses zero-based rounded axes, equal spacing, and colors by the last visibl
   assert.doesNotMatch(html, /protein-property-legend-item/)
 
   const reordered = propertyDefinitions(['frame_contacts', 'ranking_score', 'iptm'])
-  const reorderedHtml = renderParallelCoordinates(run, new Set(), null, reordered)
+  const reorderedHtml = renderParallelCoordinates(run, new Set(), null, reordered, false, 'last-property')
   assert.deepEqual(
     reordered.map(definition => definition.key),
     ['frame_contacts', 'ranking_score', 'iptm']
@@ -516,6 +859,45 @@ test('uses zero-based rounded axes, equal spacing, and colors by the last visibl
   assert.ok(reorderedHtml.indexOf('data-axis-key="ranking_score"') < reorderedHtml.indexOf('data-axis-key="iptm"'))
   assert.match(reorderedHtml, /data-color-property="iptm"/)
   assert.doesNotMatch(reorderedHtml, /<text x="-7"/)
+})
+
+test('defaults to creation-cycle colors independent of metric axes and selected candidates', () => {
+  const before = JSON.stringify(run)
+  const html = renderParallelCoordinates(run, new Set())
+  assert.match(html, /data-color-property="cycle"/)
+  assert.match(html, /older, orange/)
+  assert.match(html, /newer, purple/)
+  assert.match(html, /Age means generation, not elapsed time/)
+  const reordered = propertyDefinitions(['loss', 'iptm'])
+  const changed = renderParallelCoordinates(run, new Set(['2:cycle-2-mid']), null, reordered)
+  const colorFor = (markup, key) => markup.match(new RegExp(`data-line-key="${key}"[^>]*--candidate-color:([^";]+)`))[1]
+  assert.equal(colorFor(html, '1:cycle-1-best'), 'rgb(255 122 26)')
+  assert.equal(colorFor(html, '2:cycle-2-best'), 'rgb(145 61 224)')
+  assert.equal(colorFor(changed, '2:cycle-2-mid'), colorFor(html, '2:cycle-2-best'))
+  assert.equal(colorFor(changed, '1:cycle-1-best'), colorFor(html, '1:cycle-1-best'))
+  assert.equal(JSON.stringify(run), before)
+  const dashboard = renderProteinDesignDashboard({ runs: [run], run })
+  assert.match(dashboard, /aria-label="Candidate line color"/)
+  assert.match(dashboard, /value="cycle" selected/)
+  assert.match(dashboard, /Last visible metric/)
+  const metricDashboard = renderProteinDesignDashboard(
+    { runs: [run], run },
+    null,
+    ['iptm', 'contacts'],
+    'last-property'
+  )
+  assert.match(metricDashboard, /value="last-property" selected/)
+  assert.match(metricDashboard, /Colored by Contacts/)
+})
+
+test('cycle colors handle cycle zero, a single generation, and unknown cycles', () => {
+  const one = { ...run, cycles: [{ cycle: 0, candidates: [candidate('zero', 0, 0.8)] }] }
+  const html = renderParallelCoordinates(one, new Set())
+  assert.match(html, /--candidate-color:rgb\(200 92 125\)/)
+  assert.match(html, /Creation cycle: 0 .* to 0 /)
+  const unknown = { ...run, cycles: [{ candidates: [candidate('unknown', null, 0.8)] }] }
+  assert.match(renderParallelCoordinates(unknown, new Set()), /--candidate-color:#8a8f98/)
+  assert.doesNotMatch(renderParallelCoordinates({ ...run, cycles: [] }, new Set()), /NaN|Infinity/)
 })
 
 test('adds selected candidates to cycle leaders and animates the full selected path', () => {
@@ -562,6 +944,7 @@ test('preserves selected candidates, active candidate, expanded cycles, and list
   const root = {
     _proteinSelectedKeys: new Set(['2:cycle-2-best', '1:cycle-1-best']),
     _proteinVisiblePropertyKeys: new Set(['iptm', 'ranking_score', 'min_ipa']),
+    _proteinPropertyColorMode: 'last-property',
     _proteinActiveCandidateKey: '2:cycle-2-best',
     querySelector: selector => (selector === '.protein-candidate-table' ? body : null),
     querySelectorAll: selector =>
@@ -578,6 +961,7 @@ test('preserves selected candidates, active candidate, expanded cycles, and list
   assert.equal(body.scrollLeft, 300)
   assert.deepEqual(saved.selectedKeys, ['2:cycle-2-best', '1:cycle-1-best'])
   assert.deepEqual(saved.visiblePropertyKeys, ['iptm', 'ranking_score', 'min_ipa'])
+  assert.equal(saved.propertyColorMode, 'last-property')
   assert.equal(saved.activeCandidateKey, '2:cycle-2-best')
   assert.equal(details.open, true)
 })
@@ -594,4 +978,15 @@ test('handles cycle zero and missing selection without a mount exception', () =>
 test('does not label objective loss as a missing ranking score', () => {
   const ranking = PROPERTY_DEFINITIONS.find(item => item.key === 'ranking_score')
   assert.equal(propertyValue({ objective: 8.5, metrics: {} }, ranking), null)
+})
+
+test('missing scientific measurements break property lines instead of plotting fabricated zeroes', () => {
+  const candidate = { candidateId: 'missing-ipae', cycle: 0, metrics: { iptm: 0.8, loss: -2 } }
+  const run = { cycles: [{ cycle: 0, candidates: [candidate] }] }
+  const definitions = propertyDefinitions(['iptm', 'min_ipa', 'loss'])
+  const html = renderParallelCoordinates(run, new Set(), null, definitions)
+  assert.match(html, />Unavailable<\/text>/)
+  const coordinates = html.match(/class="protein-candidate-line is-all has-missing-values"[^>]* d="([^"]+)"/)[1]
+  assert.equal((coordinates.match(/M /g) || []).length, 2)
+  assert.doesNotMatch(coordinates, / C /)
 })

@@ -486,6 +486,17 @@ class PythonProteinDesignHarness:
             StructurePredictor,
             normalize_execution_mode,
         )
+        from opendde_harness.plugin.protein_design.servers.backends.loss_objective import (
+            CONFIDENCE_LOSS_DIRECTIONS,
+            normalize_loss_combination,
+            normalize_metric_loss_terms,
+        )
+        from opendde_harness.plugin.protein_design.servers.backends.pyrosetta_analysis import (
+            PYROSETTA_METRICS,
+            PyRosettaConfig,
+            analyze_batch,
+            interface_chains,
+        )
 
         options = dict(payload.get("options") or {})
         options["execution_mode"] = normalize_execution_mode(options.get("execution_mode"))
@@ -497,6 +508,23 @@ class PythonProteinDesignHarness:
         allowed = {item.name for item in fields(FoldConfig)}
         config_values = {key: value for key, value in options.items() if key in allowed}
         objective_key = str(options.get("objective_key", "iptm")).lower()
+        analysis_config = PyRosettaConfig.model_validate(options.get("pyrosetta", {}))
+        metric_terms = normalize_metric_loss_terms(options.get("metric_loss_terms"))
+        loss_combination = normalize_loss_combination(
+            options.get("loss_combination"), weights=options.get("loss_weights"), metric_terms=metric_terms
+        )
+        if loss_combination is not None and objective_key != "loss":
+            raise ValueError("loss_combination requires objective_key: loss")
+        enabled_terms = {name for name, term in metric_terms.items() if term["weight"] > 0}
+        if enabled_terms:
+            if objective_key != "loss":
+                raise ValueError("metric_loss_terms requires objective_key: loss")
+            if enabled_terms & PYROSETTA_METRICS.keys() and not analysis_config.enabled:
+                raise ValueError("PyRosetta metric_loss_terms requires pyrosetta.enabled: true")
+            if enabled_terms & CONFIDENCE_LOSS_DIRECTIONS.keys() and options.get("need_atom_confidence") is False:
+                raise ValueError("Confidence metric_loss_terms requires need_atom_confidence: true")
+        if analysis_config.enabled:
+            interface_chains(list(options.get("binder_chain_ids") or []), list(options.get("target_chain_ids") or []))
         if (
             options["execution_mode"] == "api"
             and objective_key == "loss"
@@ -538,6 +566,14 @@ class PythonProteinDesignHarness:
         results = predictor.predict_batch(sequences, output_dir=fold_output)
         if len(results) != len(raw_candidates):
             raise RuntimeError(f"OpenDDE returned {len(results)} results for {len(raw_candidates)} candidates")
+        analyses = analyze_batch(
+            [self._first_path(result.structure_path) if result.success else None for result in results],
+            [{chain: self._chain_sequence(value) for chain, value in chains.items()} for chains in sequences],
+            binder_chains=list(options.get("binder_chain_ids") or []),
+            target_chains=list(options.get("target_chain_ids") or []),
+            config=analysis_config,
+            output_dir=fold_output / "pyrosetta" / uuid.uuid4().hex,
+        )
         candidates = []
         for index, result in enumerate(results):
             source = raw_candidates[index]
@@ -566,12 +602,41 @@ class PythonProteinDesignHarness:
                 "iptm": float(result.iptm),
                 "ptm": float(result.ptm),
                 "plddt": float(result.plddt),
-                "ipsae": float(result.ipsae),
+                "ipsae": result.ipsae if result.ipsae is not None else 0.0,
                 "ranking_score": float(result.ranking_score),
             }
+            source_metadata["ipsae"] = {
+                "status": "unavailable" if result.ipsae is None else "success",
+                "value": result.ipsae,
+                "pae_cutoff": config_values.get("ipsae_pae_cutoff", FoldConfig.ipsae_pae_cutoff),
+                "dist_cutoff": config_values.get("ipsae_dist_cutoff", FoldConfig.ipsae_dist_cutoff),
+                "aggregation": "maximum_directed_chain_pair",
+            }
+            if result.ipsae is None:
+                source_metadata["ipsae"]["fallback_value"] = 0.0
             scoring_error = None
+            source_metadata.pop("pyrosetta", None)
+            if analysis_config.enabled:
+                analysis = analyses[index]
+                source_metadata["pyrosetta"] = analysis.model_dump()
+                metrics.update(analysis.metrics)
+                if analysis.status != "success" and analysis_config.on_failure == "fail":
+                    scoring_error = f"PyRosetta analysis {analysis.status}: {analysis.error}"
             loss_score = None
             structure_path = self._first_path(result_data.get("structure_path"))
+            from opendde_harness.plugin.protein_design.servers.backends.interchain_pae import (
+                measure_min_interchain_pae,
+            )
+
+            source_metadata["min_ipae"] = measure_min_interchain_pae(
+                confidence_path=result_data.get("all_atom_confidence_path"),
+                structure_path=structure_path,
+                sequences={chain: self._chain_sequence(value) for chain, value in fold_chains.items()},
+                binder_chains=binder_chain_ids,
+                target_chains=[str(chain) for chain in options.get("target_chain_ids") or []],
+            )
+            if source_metadata["min_ipae"]["status"] == "success":
+                metrics["min_ipae"] = source_metadata["min_ipae"]["value"]
             gate_passed, gate_evidence = self._evaluate_gate(
                 result_data,
                 sequences[index],
@@ -596,7 +661,7 @@ class PythonProteinDesignHarness:
                     "hotspot_gate": gate_evidence,
                 }
             )
-            if objective_key == "loss" and result.success:
+            if objective_key == "loss" and result.success and scoring_error is None:
                 try:
                     from opendde_harness.plugin.protein_design.servers.backends.loss_confidence_scorer import (
                         score_confidence_loss,
@@ -613,13 +678,16 @@ class PythonProteinDesignHarness:
                         esm2_pll=esm_scores[index],
                         loss_weights=options.get("loss_weights") or {},
                         target_hotspots=options.get("target_hotspots") or None,
+                        metric_values=metrics,
+                        metric_terms=metric_terms,
+                        loss_combination=loss_combination,
                     )
                     metrics["loss"] = float(loss_score["loss"])
                     metrics["loglikelihood"] = float(esm_scores[index])
                 except Exception as exc:
                     scoring_error = f"loss scoring failed: {exc}"
             fold_success = bool(result.success) and scoring_error is None
-            objective = metrics.get(objective_key)
+            objective = metrics.get(objective_key) if fold_success else None
             if objective is not None and not math.isfinite(float(objective)):
                 objective = None
                 fold_success = False

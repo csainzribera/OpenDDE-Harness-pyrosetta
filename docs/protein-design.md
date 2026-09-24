@@ -23,7 +23,7 @@ container, reuse a running one of the installed release, or connect to an existi
 service. For a local container it pulls a missing prebuilt image after confirmation,
 prepares SolubleMPNN and ESM2 650M in both modes, and adds the OpenDDE
 checkpoint/common data in local mode. See the
-[onboarding guide](onboarding.md) for the three-step workflow and local/API modes.
+[onboarding guide](onboarding.md) for the setup workflow and local/API modes.
 
 The following JSON is an advanced configuration reference, not a required setup
 step. If editing `~/.opendde_harness/config.json` manually, merge only the fields
@@ -96,6 +96,13 @@ candidate downloads remain bound to that URL. The task status and Dashboard
 show the resolved worker. If `compute` is omitted, the configured worker pool is
 load-balanced; if no registry exists, the plugin-level `compute_url` (default
 `http://127.0.0.1:8080`) is used.
+
+For PyRosetta-enabled tasks, every worker eligible for that placement must provide
+the analysis dependency. Worker profiles/backends do not certify PyRosetta
+availability. Pin a prepared worker explicitly when the pool is heterogeneous;
+do not assume a saved local custom image controls an explicit remote URL. Managed
+local compute resolves its current port at runtime. See
+[selected-runtime verification](pyrosetta.md#verify-the-selected-runtime).
 
 ### Place jobs on GPUs inside one worker
 
@@ -429,6 +436,38 @@ Results remain visible if subsequent speculation, quality assessment, population
 persistence, reflection, or memory work blocks or fails. Terminal refold results
 are visible before pose analysis and final filtering. These changes require a
 new worker process; they do not backfill historical runs automatically.
+
+### Terminal selection policy
+
+When terminal refolding is enabled, fresh refolds must pass the same scoring,
+canonical-sequence, CDR-contact/hotspot gates and configured conditional quality
+checks as search. Required metric loss terms cannot be missing or non-finite.
+The final eligible candidates are ordered by the configured objective and its
+direction, with the first `top_k` selected. For loss optimization this is the
+composite loss, not just its structural/ESM-2 base. PostFilter commentary is
+advisory: it cannot admit a rejected candidate or replace objective ordering.
+The deterministic fallback uses the same policy if commentary is unavailable.
+If every terminal candidate is ineligible, the task and final selection fail
+explicitly while retaining search and refold evidence for diagnosis.
+When terminal refolding is disabled, final selection is restricted to actual
+quality-admitted candidates from the last search cycle; a stale parent quality
+verdict cannot admit a newly rejected candidate.
+
+Quality prompts use deterministic current-candidate chain sequences, configured
+zero-based CDR positions, fixed/mutable masks and residue/motif locations. Initial
+scaffold prose is not reused as current sequence evidence; it can become stale
+after mutation and may contain incorrect residue annotations. The prompt retains
+current metrics, gate and pose evidence but omits large contact lists and duplicated
+loss metadata. Cysteine presence alone does not establish an unpaired thiol, and a
+potential N-X-S/T sequon (X not Pro) is not proof of glycosylation; see
+[PROSITE's sequon guidance](https://prosite.expasy.org/PDOC00001). These changes ground
+the existing quality assessment; they do not relax its High Risk rejection rule,
+thresholds, sequence constraints, or objective ordering.
+Structured-output validation also rejects `pass_check: true` when any quality
+dimension or overall risk is High Risk (including shorthand `high`, case, spacing
+and hyphenation variants). The existing bounded response-repair loop receives that error; an
+unrepaired contradiction fails closed. This does not turn a failed verdict into
+a passing one or assign favorable meaning to Unknown evidence.
 
 ## Configuring every YAML parameter
 

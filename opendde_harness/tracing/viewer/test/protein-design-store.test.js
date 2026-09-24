@@ -132,6 +132,7 @@ test('projects dynamic cycle and global-best metric series without conflating ca
         objective: 0.4,
         metrics: {
           iptm: 0.7,
+          rosetta_interface_dg: -12.5,
           confidence: { plddt: 82.5 },
           gate_passed: 1.0,
           cdr3_gate_passed: 1.0,
@@ -186,10 +187,12 @@ test('projects dynamic cycle and global-best metric series without conflating ca
       {
         candidate_id: 'cycle-best',
         sequence: 'ACDE',
-        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1 },
+        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1, rosetta_interface_dg: -15 },
         metadata: {
           gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
-          loss: { loss_components: { i_pae: 0.3 } }
+          loss: { loss_components: { i_pae: 0.3 } },
+          min_ipae: { status: 'success', value: 2.5, units: 'angstrom' },
+          pyrosetta: { status: 'success', metrics: { rosetta_interface_dg: -15 } }
         }
       }
     ],
@@ -235,7 +238,8 @@ test('projects dynamic cycle and global-best metric series without conflating ca
     readArtifact: artifactPath => artifacts.get(artifactPath) || null
   })
 
-  assert.deepEqual(projected.run.metricNames, ['confidence.plddt', 'iptm', 'loss'])
+  assert.deepEqual(projected.run.metricNames, ['confidence.plddt', 'iptm', 'loss', 'rosetta_interface_dg'])
+  assert.equal(projected.run.series.rosetta_interface_dg.cycleBest[0].value, -12.5)
   assert.deepEqual(projected.run.series.loss.cycleBest, [{ cycle: 0, candidateId: 'cycle-best', value: 0.4 }])
   assert.deepEqual(projected.run.series.loss.globalBest, [{ cycle: 0, candidateId: 'global-best', value: 0.3 }])
   assert.equal(projected.run.structures[0].candidateId, 'cycle-best')
@@ -256,6 +260,7 @@ test('projects dynamic cycle and global-best metric series without conflating ca
   assert.deepEqual(projected.run.postFilter.decisions[0].binderChainIds, ['D'])
   assert.equal(projected.run.postFilter.decisions[0].sequence, 'ACDE')
   assert.equal(projected.run.postFilter.decisions[0].metrics.iptm, 0.81)
+  assert.equal(projected.run.postFilter.decisions[0].metrics.rosetta_interface_dg, -15)
   assert.equal(projected.run.postFilter.decisions[0].metrics.plddt, 0.88)
   assert.equal(projected.run.postFilter.decisions[0].metrics.cdr_contact_fraction, 0.84)
   assert.equal(projected.run.postFilter.decisions[0].metrics.gate_passed, undefined)
@@ -555,6 +560,53 @@ test('post-filter failures are failed, never fallback, and obsolete scores are i
     assert.equal(Object.hasOwn(result, 'metricWeights'), false)
     assert.equal(Object.hasOwn(result.decisions[0], 'score'), false)
     assert.equal(result.decisions[0].rank, 1)
-    assert.deepEqual(result.decisions[0].metadata, { gate_evidence: null, loss: null })
+    assert.deepEqual(result.decisions[0].metadata, { gate_evidence: null, loss: null, min_ipae: null, pyrosetta: null })
+  }
+})
+
+test('terminal raw Min ipAE preserves exact persisted provenance including unavailable reasons', () => {
+  const provenance = {
+    status: 'success',
+    value: 17.8799991607666,
+    units: 'angstrom',
+    definition: 'Minimum raw PAE over valid-frame binder/target pairs in both directions',
+    binder_chains: ['D'],
+    target_chains: ['A'],
+    confidence_path: '/actual/post_refold/full_data.json',
+    structure_path: '/actual/post_refold/structure.cif',
+    frame_policy: 'Require token_has_frame=1 on both the PAE row and column',
+    axis_semantics: 'binder_to_target uses binder rows/target columns',
+    directional_minima: { binder_to_target: 17.8799991607666, target_to_binder: 18.780000686645508 },
+    matrix_shape: [348, 348],
+    matrix_key: 'token_pair_pae',
+    chain_mapping: {
+      A: { asym_id: 0, residue_count: 220, valid_frame_count: 220 },
+      D: { asym_id: 1, residue_count: 128, valid_frame_count: 128 }
+    },
+    mapping_method: 'Exact structure atom rows checked against confidence asym IDs and sequences'
+  }
+  for (const metadata of [
+    provenance,
+    { ...provenance, value: 0 },
+    { status: 'unavailable', reason: 'Missing raw PAE' }
+  ]) {
+    const metrics = metadata.status === 'success' ? { min_ipae: metadata.value } : {}
+    const artifact = {
+      mode: 'deterministic',
+      post_filter_enabled: true,
+      post_filter_executed: true,
+      post_filter_top_k: 1,
+      selected_candidate_ids: ['fresh'],
+      candidates: [{ candidate_id: 'fresh', metrics, metadata: { min_ipae: metadata } }],
+      decisions: [{ candidate_id: 'fresh', rank: 1, pass_filter: true, hard_eligible: true }]
+    }
+    const projected = projectProteinDesignRuns({
+      spans: [runSpan('task-1', { finalSelectionArtifactPath: '/final.json' })],
+      selectedRunId: 'task-1',
+      readArtifact: artifactPath => (artifactPath === '/final.json' ? artifact : null)
+    })
+    const decision = projected.run.postFilter.decisions[0]
+    assert.deepEqual(decision.metadata.min_ipae, metadata)
+    assert.deepEqual(decision.metrics, metrics)
   }
 })

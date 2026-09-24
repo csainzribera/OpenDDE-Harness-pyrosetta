@@ -12,14 +12,38 @@ forward the actual viewer port with SSH; for port 4318, use
 - Browse candidates by cycle, sort/filter the table and select structures to compare.
   Scroll horizontally to see all recorded numeric metrics; the header stays aligned
   with the rows. Copy retrieves the complete sequence, not its shortened preview.
+- Above the properties chart, choose **Color by → Age / cycle** (the default)
+  to colour candidates by their creation cycle: older generations are orange and
+  newer generations purple. This means generation, not elapsed wall-clock age;
+  candidates from the same cycle have the same colour. **Last visible metric**
+  restores metric-based colouring. The choice is independent of visible axes and
+  is remembered in this browser across refreshes. It changes visualization only,
+  never the running task, candidate scores, or selection.
 - Sequence summaries show CDR labels directly. Hover for the complete sequence;
   the full sequence and structure viewer's sequence strip use matching purple CDR
   highlighting. CDR positions come from the
   task's saved, parsed YAML configuration; positions are zero-based and inclusive.
-- The 3Dmol.js viewer displays the target in `#cccccc` and binder in `#a194f3`.
-- **Min ipAE** refers to the available interface PAE metric, not whole-complex PAE.
+- The Mol* viewer displays the target and binder with distinct colours and
+  supports design, chain, element, pLDDT and residue-order colouring. These
+  structure colours are independent of the candidate-line colour selector.
+- **Min ipAE** is the raw minimum predicted aligned error in Å across all
+  configured binder–target residue pairs with valid alignment frames, considering
+  both matrix directions. The frame mask follows the model's
+  [chain-pair PAE calculation](https://github.com/bytedance/Protenix/blob/main/protenix/model/sample_confidence.py).
+  Target–target, binder–binder and same-chain pairs are excluded. It is not the
+  normalized mean `i_pae` loss, whole-complex PAE, or the distinct ipSAE score.
+  The metric uses confidence-matrix indices mapped to the actual folded structure
+  chains; missing or inconsistent confidence/mapping data remains unavailable
+  with an explanation in `metadata.min_ipae`, never a fabricated zero. Historical
+  runs without this recorded metric are not retroactively rewritten. A low
+  minimum describes the best individual pair, not the entire interface, and does
+  not replace contact/quality gates or alter the configured composite objective.
 - Switch **View** to **Post-filter** for terminal ranking, per-candidate metrics and
   structures. If that stage has not produced data, the panel remains empty.
+- Optional [PyRosetta analysis](pyrosetta.md) adds relaxed interface scores to the
+  same numeric columns and comparison controls. The candidate's PyRosetta status
+  tooltip explains failures and loss contributions. Structures in the viewer remain
+  the original folds; the relaxed PDB is retained separately on compute.
 
 ## Design loop and search tree
 
