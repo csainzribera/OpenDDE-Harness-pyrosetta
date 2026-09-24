@@ -9,6 +9,8 @@
 
 ![tui](docs/assets/tui.png)
 
+**Disclaimer:** This version includes support for PyRosetta, which is subject to separate licensing claims. 
+
 Harness for agentic antibody design: prepare targets, optimize CDR sequences, predict structures with OpenDDE, and inspect results. Supports VHH, scFv and paired VH/VL binders while preserving configured fixed residues.
 
 - Guided setup and reviewed design plans in natural language.
